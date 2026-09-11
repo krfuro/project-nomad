@@ -4,7 +4,6 @@ import { DateTime } from 'luxon'
 import logger from '@adonisjs/core/services/logger'
 import InstalledResource from '#models/installed_resource'
 import { isRawListRemoteZimFilesResponse } from '../../util/zim.js'
-import { KIWIX_CATALOG_BASE_URL } from '../../constants/kiwix.js'
 
 /**
  * Local, in-process freshness check for installed content (Kiwix ZIM files +
@@ -25,6 +24,7 @@ import { KIWIX_CATALOG_BASE_URL } from '../../constants/kiwix.js'
  * defensive — a malformed entry is skipped, never thrown.
  */
 
+const KIWIX_CATALOG_URL = 'https://browse.library.kiwix.org/catalog/v2/entries'
 const GITHUB_PMTILES_URL =
   'https://api.github.com/repos/Crosstalk-Solutions/project-nomad-maps/contents/pmtiles'
 
@@ -187,7 +187,7 @@ export class KiwixCatalogService {
     count: number
     start: number
   }): Promise<{ entries: CatalogZimEntry[]; totalResults: number }> {
-    const res = await axios.get(KIWIX_CATALOG_BASE_URL, {
+    const res = await axios.get(KIWIX_CATALOG_URL, {
       params: {
         start: params.start,
         count: params.count,

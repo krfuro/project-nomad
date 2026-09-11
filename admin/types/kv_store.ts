@@ -4,6 +4,16 @@ export const KV_STORE_SCHEMA = {
   'chat.lastModel':             'string',
   'rag.docsEmbedded':           'boolean',
   'rag.defaultIngestPolicy':    'string',
+  // Master switch for chat-time knowledge base retrieval. Unset/null means ON —
+  // the pre-existing behaviour. Turning it off skips the whole retrieval
+  // pipeline (hasDocuments, the query-rewrite LLM call, and the Qdrant search),
+  // which matters on small hardware and when the KB is small or empty.
+  'rag.enabled':                'boolean',
+  // Relevance floor for retrieved chunks, as a stringified number in [0,1]
+  // ("0.6"). Unset means "use RAG_MIN_FINAL_SCORE"; "0" explicitly means off.
+  // Stored as the number rather than a preset name so retuning the presets in
+  // Settings > Models cannot invalidate a value someone already saved.
+  'rag.minRelevance':           'string',
   'system.updateAvailable':     'boolean',
   'system.latestVersion':       'string',
   'system.earlyAccess':         'boolean',
@@ -39,6 +49,23 @@ export const KV_STORE_SCHEMA = {
   'ai.remoteOllamaUrl':         'string',
   'ai.ollamaFlashAttention':    'boolean',
   'ai.autoThinking':            'boolean',
+  // Model used for ancillary AI work (chat titles, chat suggestions) instead of
+  // whatever chat model the user last used. Unset/null keeps the previous
+  // behaviour: titles use the chat model, suggestions use chat.lastModel.
+  'ai.tasksModel':              'string',
+  // Learned per-model token-estimator corrections, as a JSON object keyed by
+  // model name ({"llama3:8b":1.02,"qwen2.5:0.5b":1.26}). One row rather than a
+  // key per model, since KVStoreKey is a closed union. Written by
+  // TokenCalibrationService from the `prompt_eval_count` every chat response
+  // already reports; safe to delete, it just re-learns.
+  'ai.tokenRatios':             'string',
+  // User cap on the chat context window, in tokens ("4096".."131072"), or
+  // "auto"/unset to let ContextWindowResolver size it from the model and the
+  // hardware. A cap only ever lowers the resolved value.
+  'ai.contextWindow':           'string',
+  // How long Ollama keeps a chat model (and its KV cache) resident after a
+  // request, in Ollama's duration format ("10m"). Unset inherits Ollama's 5m.
+  'ai.keepAlive':               'string',
   'ai.amdGpuAcceleration':      'boolean',
   'ai.amdHsaOverride':          'string',
   'ai.autoFixGpuPassthrough':   'boolean',

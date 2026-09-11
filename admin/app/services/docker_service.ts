@@ -26,6 +26,7 @@ import { randomBytes } from 'node:crypto'
 import KVStore from '#models/kv_store'
 import { BROADCAST_CHANNELS } from '../../constants/broadcast.js'
 import { KIWIX_LIBRARY_CMD } from '../../constants/kiwix.js'
+import { DEFAULT_OLLAMA_CONTEXT_LENGTH } from '../../constants/ollama.js'
 
 @inject()
 export class DockerService {
@@ -810,7 +811,18 @@ export class DockerService {
         const flashAttentionEnabled = await KVStore.getValue('ai.ollamaFlashAttention')
         if (flashAttentionEnabled !== false) {
           ollamaEnv.push('OLLAMA_FLASH_ATTENTION=1')
+          // KV cache quantization requires flash attention. q8_0 roughly halves the
+          // memory a context window costs for a perplexity delta in the noise, which is
+          // what makes an 8-16k window affordable on modest hardware. Ollama silently
+          // falls back to f16 on architectures that don't support it, so this is treated
+          // as headroom — the context-window resolver still budgets against f16.
+          ollamaEnv.push('OLLAMA_KV_CACHE_TYPE=q8_0')
         }
+        // Floor for any request that doesn't carry its own num_ctx (the OpenAI-compatible
+        // path can't set one at all). Ollama's own default is 4096 on machines under 24GB
+        // VRAM, and anything past the window is silently truncated with no error — so a
+        // conversation that outgrows it just quietly loses its early turns.
+        ollamaEnv.push(`OLLAMA_CONTEXT_LENGTH=${DEFAULT_OLLAMA_CONTEXT_LENGTH}`)
         if (amdGpuConfigured) {
           // gfx-aware HSA override — only set for cards that actually need it. See
           // _resolveAmdHsaOverride() for the resolution order and gfx → version mapping.
@@ -838,8 +850,10 @@ export class DockerService {
         'creating',
         `Creating Docker container for service ${service.service_name}...`
       )
-      const container = await this.docker.createContainer({
-        Image: finalImage,
+      // Built once and reused, so the AMD fallback below cannot drift from the
+      // real payload as this config grows.
+      const buildCreateOptions = (image: string, hostConfig: any, env: string[]) => ({
+        Image: image,
         name: service.service_name,
         Labels: {
           ...(containerConfig?.Labels ?? {}),
@@ -847,10 +861,10 @@ export class DockerService {
           'io.project-nomad.managed': 'true',
         },
         ...(containerConfig?.User && { User: containerConfig.User }),
-        HostConfig: gpuHostConfig,
+        HostConfig: hostConfig,
         ...(containerConfig?.WorkingDir && { WorkingDir: containerConfig.WorkingDir }),
         ...(containerConfig?.ExposedPorts && { ExposedPorts: containerConfig.ExposedPorts }),
-        Env: [...(containerConfig?.Env ?? []), ...ollamaEnv, ...appEnv],
+        Env: env,
         ...(service.container_command ? { Cmd: service.container_command.split(' ') } : {}),
         // Ensure container is attached to the Nomad docker network in production
         ...(process.env.NODE_ENV === 'production' && {
@@ -862,12 +876,76 @@ export class DockerService {
         }),
       })
 
+      let container = await this.docker.createContainer(
+        buildCreateOptions(finalImage, gpuHostConfig, [
+          ...(containerConfig?.Env ?? []),
+          ...ollamaEnv,
+          ...appEnv,
+        ])
+      )
+
       this._broadcast(
         service.service_name,
         'starting',
         `Starting Docker container for service ${service.service_name}...`
       )
-      await container.start()
+      try {
+        await container.start()
+      } catch (error: any) {
+        // An AMD GPU whose ROCm device nodes are absent must not block the install
+        // outright (#1232). GPU detection reads PCI data, so "an AMD GPU is present"
+        // and "ROCm is usable" are different questions, and only the daemon can
+        // answer the second. CPU-only Ollama works fine on these machines.
+        //
+        // This has to sit on start(), not createContainer(): the daemon accepts a
+        // container whose --device path does not exist (create returns 201) and only
+        // resolves devices when the container starts. Measured on Docker 29.6.2.
+        //
+        // Retrying rather than pre-checking is also deliberate. The admin runs in its
+        // own container, so stat()ing /dev/kfd here describes the admin's namespace,
+        // not the host's. Verified on NOMAD6, a working ROCm box: /dev/kfd is present
+        // on the host and absent inside the admin container, so a pre-check would
+        // strip GPU passthrough from a machine where it works.
+        if (!amdGpuConfigured || !this._isMissingDeviceError(error)) throw error
+
+        logger.warn(
+          `[DockerService] AMD device passthrough rejected by the daemon (${error?.message}); ` +
+            `recreating ${service.service_name} CPU-only on ${service.container_image}`
+        )
+        this._broadcast(
+          service.service_name,
+          'gpu-config',
+          `AMD GPU detected, but this system has no usable ROCm device (/dev/kfd is missing, ` +
+            `which means the amdgpu/ROCm kernel driver is not loaded or does not support this GPU). ` +
+            `Installing CPU-only instead so the AI Assistant still works.`
+        )
+
+        // The created container carries the rejected device config, so it cannot be
+        // started as-is and has to go before the name can be reused.
+        await container.remove({ force: true }).catch((removeError: any) => {
+          logger.warn(`[DockerService] Could not remove the failed container: ${removeError?.message}`)
+        })
+
+        const { Devices, ...cpuHostConfig } = gpuHostConfig as any
+        // Drop the ROCm-only env along with the devices. HSA_OVERRIDE_GFX_VERSION and
+        // OLLAMA_IGPU_ENABLE mean nothing to the CPU build, and leaving them behind is
+        // misleading to anyone who later reads `docker inspect`.
+        const cpuOllamaEnv = ollamaEnv.filter(
+          (e) => !e.startsWith('HSA_OVERRIDE_GFX_VERSION=') && !e.startsWith('OLLAMA_IGPU_ENABLE=')
+        )
+        amdGpuConfigured = false
+        // service.container_image is the CPU tag, already pulled earlier in this
+        // function before the AMD branch overrode finalImage to :rocm.
+        finalImage = service.container_image
+        container = await this.docker.createContainer(
+          buildCreateOptions(finalImage, cpuHostConfig, [
+            ...(containerConfig?.Env ?? []),
+            ...cpuOllamaEnv,
+            ...appEnv,
+          ])
+        )
+        await container.start()
+      }
 
       this._broadcast(
         service.service_name,
@@ -1567,6 +1645,28 @@ export class DockerService {
       { PathOnHost: '/dev/kfd', PathInContainer: '/dev/kfd', CgroupPermissions: 'rwm' },
       { PathOnHost: '/dev/dri', PathInContainer: '/dev/dri', CgroupPermissions: 'rwm' },
     ]
+  }
+
+  /**
+   * Whether a container-create failure was the daemon refusing a `--device` path
+   * that does not exist on the host, e.g.
+   *
+   *   (HTTP code 500) server error - error gathering device information while
+   *   adding custom device "/dev/kfd": no such file or directory
+   *
+   * GPU *detection* reads PCI data, which says nothing about whether the ROCm
+   * kernel interface was ever loaded. An AMD card with no `/dev/kfd` is a
+   * perfectly normal machine — old pre-ROCm silicon, or amdgpu not loaded — and
+   * on those the create fails outright and the whole install dies (#1232).
+   *
+   * Deliberately keyed on the device-gathering phrase rather than a bare "no
+   * such file or directory", which Docker also emits for missing bind-mount
+   * sources and image layers. Falling back to CPU on one of those would hide a
+   * real failure behind a degraded install.
+   */
+  private _isMissingDeviceError(error: any): boolean {
+    const raw: string = error?.message ?? String(error)
+    return /error gathering device information while adding custom device/i.test(raw)
   }
 
   /**

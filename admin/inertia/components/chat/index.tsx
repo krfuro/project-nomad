@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import ChatSidebar from './ChatSidebar'
 import ChatInterface from './ChatInterface'
@@ -7,10 +7,9 @@ import StyledModal from '../StyledModal'
 import api from '~/lib/api'
 import { formatBytes } from '~/lib/util'
 import { useModals } from '~/context/ModalContext'
-import { ChatMessage } from '../../../types/chat'
+import { ChatImageAttachment, ChatMessage } from '../../../types/chat'
 import classNames from '~/lib/classNames'
 import { IconMenu2, IconX } from '@tabler/icons-react'
-import { DEFAULT_QUERY_REWRITE_MODEL } from '../../../constants/ollama'
 import { useSystemSetting } from '~/hooks/useSystemSetting'
 import Switch from '~/components/inputs/Switch'
 import InfoTooltip from '~/components/InfoTooltip'
@@ -76,6 +75,33 @@ export default function Chat({
   const autoThinkingDefault =
     autoThinkingSetting?.value === true || autoThinkingSetting?.value === 'true'
 
+  // Knowledge base retrieval, shared with AI Assistant settings (same KV key).
+  // Unset means on, so coerce off the negative — an absent value must not read
+  // as false.
+  const { data: ragEnabledSetting } = useSystemSetting({ key: 'rag.enabled', enabled })
+  const ragEnabled = !(ragEnabledSetting?.value === false || ragEnabledSetting?.value === 'false')
+
+  const ragEnabledMutation = useMutation({
+    mutationFn: async (value: boolean) => await api.updateSetting('rag.enabled', value),
+    // Flip the switch immediately rather than after the round-trip, and roll
+    // back if the write fails.
+    onMutate: async (value: boolean) => {
+      await queryClient.cancelQueries({ queryKey: ['system-setting', 'rag.enabled'] })
+      const previous = queryClient.getQueryData(['system-setting', 'rag.enabled'])
+      queryClient.setQueryData(['system-setting', 'rag.enabled'], {
+        key: 'rag.enabled',
+        value,
+      })
+      return { previous }
+    },
+    onError: (_err, _value, context) => {
+      queryClient.setQueryData(['system-setting', 'rag.enabled'], context?.previous)
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['system-setting', 'rag.enabled'] })
+    },
+  })
+
   const { data: remoteStatus } = useQuery({
     queryKey: ['remoteOllamaStatus'],
     queryFn: () => api.getRemoteOllamaStatus(),
@@ -106,13 +132,15 @@ export default function Chat({
       try {
         const stored = localStorage.getItem(`nomad:thinking:${m.name}`)
         if (stored !== null) next[m.name] = stored === 'true'
-      } catch {}
+      } catch { }
     }
     setThinkingOverrides(next)
   }, [installedModels])
 
   const selectedModelSupportsThinking =
     installedModels.find((m) => m.name === selectedModel)?.thinking === true
+  const selectedModelVisionCapability =
+    installedModels.find((m) => m.name === selectedModel)?.vision ?? 'unknown'
 
   // Effective thinking preference for a model: explicit override wins, else the global default.
   const effectiveThinking = useCallback(
@@ -125,7 +153,7 @@ export default function Chat({
     setThinkingOverrides((prev) => ({ ...prev, [model]: value }))
     try {
       localStorage.setItem(`nomad:thinking:${model}`, String(value))
-    } catch {}
+    } catch { }
   }, [])
 
   const { data: chatSuggestions, isLoading: chatSuggestionsLoading } = useQuery<string[]>({
@@ -138,10 +166,6 @@ export default function Chat({
     refetchOnWindowFocus: false,
     refetchOnMount: false,
   })
-
-  const rewriteModelAvailable = useMemo(() => {
-    return installedModels.some((model) => model.name === DEFAULT_QUERY_REWRITE_MODEL)
-  }, [installedModels])
 
   const deleteAllSessionsMutation = useMutation({
     mutationFn: () => api.deleteAllChatSessions(),
@@ -157,6 +181,7 @@ export default function Chat({
     mutationFn: (request: {
       model: string
       messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+      images?: File[]
       sessionId?: number
       think?: boolean
       collection?: string
@@ -308,6 +333,7 @@ export default function Chat({
             role: m.role,
             content: m.content,
             timestamp: new Date(m.timestamp),
+            sources: m.sources,
           }))
         )
       } else {
@@ -334,7 +360,7 @@ export default function Chat({
   )
 
   const handleSendMessage = useCallback(
-    async (content: string) => {
+    async (content: string, images: ChatImageAttachment[] = []) => {
       let sessionId = activeSessionId
 
       // Create a new session if none exists
@@ -354,6 +380,7 @@ export default function Chat({
         id: `msg-${Date.now()}`,
         role: 'user',
         content,
+        images,
         timestamp: new Date(),
       }
 
@@ -387,6 +414,7 @@ export default function Chat({
               stream: true,
               sessionId: sessionId ? Number(sessionId) : undefined, think: effectiveThinking(selectedModel),
               collection: collectionFilter || undefined,
+              images: images.map((image) => image.file),
             },
             (chunkContent, chunkThinking, done) => {
               if (chunkThinking.length > 0 && thinkingStartTime === null) {
@@ -422,13 +450,13 @@ export default function Chat({
                   prev.map((m) =>
                     m.id === assistantMsgId
                       ? {
-                          ...m,
-                          content: m.content + chunkContent,
-                          thinking: (m.thinking ?? '') + chunkThinking,
-                          isStreaming: !done,
-                          isThinking: isThinkingPhase,
-                          thinkingDuration: thinkingDuration ?? undefined,
-                        }
+                        ...m,
+                        content: m.content + chunkContent,
+                        thinking: (m.thinking ?? '') + chunkThinking,
+                        isStreaming: !done,
+                        isThinking: isThinkingPhase,
+                        thinkingDuration: thinkingDuration ?? undefined,
+                      }
                       : m
                   )
                 )
@@ -436,7 +464,12 @@ export default function Chat({
               fullContent += chunkContent
               thinkingContent += chunkThinking
             },
-            abortController.signal
+            abortController.signal,
+            (sources) => {
+              setMessages((prev) =>
+                prev.map((m) => (m.id === assistantMsgId ? { ...m, sources } : m))
+              )
+            }
           )
         } catch (error: any) {
           if (error?.name !== 'AbortError') {
@@ -450,7 +483,10 @@ export default function Chat({
                 {
                   id: assistantMsgId,
                   role: 'assistant',
-                  content: 'Sorry, there was an error processing your request. Please try again.',
+                  content:
+                    error instanceof Error
+                      ? error.message
+                      : 'Sorry, there was an error processing your request. Please try again.',
                   timestamp: new Date(),
                 },
               ]
@@ -479,6 +515,7 @@ export default function Chat({
           sessionId: sessionId ? Number(sessionId) : undefined,
           think: effectiveThinking(selectedModel),
           collection: collectionFilter || undefined,
+          images: images.map((image) => image.file),
         })
       }
     },
@@ -558,23 +595,25 @@ export default function Chat({
                   {remoteStatus?.connected === false ? 'Remote Disconnected' : 'Remote Connected'}
                 </span>
               )}
-              <div className="flex items-center gap-2">
-              <label htmlFor="collection-select" className="text-sm text-text-secondary">
-                Search in:
-              </label>
-              <select
-                id="collection-select"
-                value={collectionFilter}
-                onChange={(e) => setCollectionFilter(e.target.value)}
-                className="px-3 py-1.5 border border-border-default rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-desert-green focus:border-transparent bg-surface-primary"
-              >
-                <option value="">All</option>
-                {knownCollections.map((c) => (
-                  <option key={c} value={c}>{c}</option>
-                ))}
-              </select>
-            </div>
-            <div className="flex items-center gap-2 min-w-0">
+              {ragEnabled && (
+                <div className="flex items-center gap-2">
+                  <label htmlFor="collection-select" className="text-sm text-text-secondary">
+                    Search in:
+                  </label>
+                  <select
+                    id="collection-select"
+                    value={collectionFilter}
+                    onChange={(e) => setCollectionFilter(e.target.value)}
+                    className="px-3 py-1.5 border border-border-default rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-desert-green focus:border-transparent bg-surface-primary"
+                  >
+                    <option value="">All</option>
+                    {knownCollections.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              <div className="flex items-center gap-2 min-w-0">
                 <label htmlFor="model-select" className="text-sm text-text-secondary">
                   Model:
                 </label>
@@ -598,22 +637,35 @@ export default function Chat({
                   </select>
                 )}
               </div>
-              {selectedModelSupportsThinking && (
               <div className="flex items-center">
-                <span className="text-sm text-text-secondary select-none">Thinking:</span>
+                <span className="text-sm text-text-secondary select-none">Knowledge Base:</span>
                 <InfoTooltip
                   position="bottom"
                   align="right"
-                  text="When on, this model works through its reasoning before answering. Slower, but often better on tricky questions. Your choice is remembered for this model; the default for other models is set in AI Assistant settings."
+                  text="When on, the assistant searches your knowledge base for relevant documents before answering. Turning this off is faster and lighter on hardware, which helps when your knowledge base is small or empty. This is the same setting as in AI Assistant settings."
                 />
                 <Switch
-                  id="chat-thinking-toggle"
-                  checked={effectiveThinking(selectedModel)}
-                  onChange={(v) => setModelThinking(selectedModel, v)}
+                  id="chat-rag-toggle"
+                  checked={ragEnabled}
+                  onChange={(v) => ragEnabledMutation.mutate(v)}
                 />
               </div>
-            )}
-            {isInModal && (
+              {selectedModelSupportsThinking && (
+                <div className="flex items-center">
+                  <span className="text-sm text-text-secondary select-none">Thinking:</span>
+                  <InfoTooltip
+                    position="bottom"
+                    align="right"
+                    text="When on, this model works through its reasoning before answering. Slower, but often better on tricky questions. Your choice is remembered for this model; the default for other models is set in AI Assistant settings."
+                  />
+                  <Switch
+                    id="chat-thinking-toggle"
+                    checked={effectiveThinking(selectedModel)}
+                    onChange={(v) => setModelThinking(selectedModel, v)}
+                  />
+                </div>
+              )}
+              {isInModal && (
                 <button
                   type="button"
                   aria-label="Close chat"
@@ -632,11 +684,11 @@ export default function Chat({
           <ChatInterface
             messages={messages}
             onSendMessage={handleSendMessage}
+            visionCapability={selectedModelVisionCapability}
             isLoading={isStreamingResponse || chatMutation.isPending}
             chatSuggestions={chatSuggestions}
             chatSuggestionsEnabled={suggestionsEnabled}
             chatSuggestionsLoading={chatSuggestionsLoading}
-            rewriteModelAvailable={rewriteModelAvailable}
           />
         </div>
       </div>
