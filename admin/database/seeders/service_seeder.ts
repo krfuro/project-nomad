@@ -542,6 +542,41 @@ export default class ServiceSeeder extends BaseSeeder {
       depends_on: null,
       metadata: JSON.stringify({ minMemoryMB: 2048, minDiskMB: 20480 }),
     },
+    {
+      service_name: SERVICE_NAMES.COMMSCRIBE,
+      friendly_name: 'Commscribe',
+      powered_by: 'Commscribe',
+      display_order: 28,
+      description: 'Offline speech-to-text — upload recordings, get transcripts and translations',
+      icon: 'IconMicrophone',
+      container_image: 'ghcr.io/krfuro/commscribe:1.1.0',
+      source_repo: 'https://github.com/krfuro/commscribe',
+      container_command: null,
+      container_config: JSON.stringify({
+        HostConfig: {
+          RestartPolicy: { Name: 'unless-stopped' },
+          PortBindings: { '8420/tcp': [{ HostPort: '8460' }] },
+          // Database, converted audio, settings and speech models all live under /data. The
+          // default model ships inside the image and is copied here on first start, so the app
+          // transcribes with no internet from the moment it is installed.
+          Binds: [`${ServiceSeeder.NOMAD_STORAGE_ABS_PATH}/commscribe:/data`],
+        },
+        ExposedPorts: { '8420/tcp': {} },
+        // The image already listens on all interfaces with access control off (NOMAD has no login
+        // and the Open link cannot carry a key) and points translation at the AI Assistant's
+        // Ollama on the NOMAD docker network, so no environment variables are needed here.
+      }),
+      ui_location: '8460',
+      installed: false,
+      installation_status: 'idle',
+      is_dependency_service: false,
+      is_custom: false,
+      category: 'productivity',
+      depends_on: null,
+      // Whisper small (int8) needs about a gigabyte while transcribing; the image is ~1 GB and
+      // larger models downloaded from inside the app take up to 3 GB each.
+      metadata: JSON.stringify({ minMemoryMB: 2048, minDiskMB: 4096 }),
+    },
   ]
 
   async run() {

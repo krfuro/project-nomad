@@ -282,3 +282,19 @@ A browser-based client for [MeshCore](https://meshcore.io) radios. MeshCore is a
 **Your data:** There's nothing to set up or store on your NOMAD for this app. Your radio's settings live on the radio itself, and the app's preferences live in your browser. There's no NOMAD folder to manage.
 
 **Works offline:** Fully offline, which is the whole point of MeshCore. The app is served from your NOMAD and talks to your radio directly over USB or Bluetooth, never the internet.
+
+## Commscribe {% #commscribe %}
+
+Offline speech-to-text for recordings. Upload an audio file (a meeting, a dictation, a voice memo, a radio log exported from another device) and Commscribe transcribes it right on your NOMAD with a Whisper speech model. The default model is trained on Norwegian and also handles English; multilingual OpenAI Whisper models can be added for other languages. Each recording becomes a card with playback and text that you can edit, search, star, and export as plain text, Markdown, CSV, SRT subtitles, or JSON. Translation into English is built into the model; translation into other languages goes through the AI Assistant's Ollama, if you have that installed with at least one model downloaded.
+
+**Official site / source:** [github.com/krfuro/commscribe](https://github.com/krfuro/commscribe)
+
+**First time you open it:** It opens straight to the log, no login and no account. A short wizard runs once to pick the speech model and the interface language (English by default; Norwegian, Swedish, German, French, and Spanish are available). The default model, `nb-whisper-small` (about 480 MB), ships inside the image, so transcription works with no internet from the first start. Larger or multilingual models can be downloaded from **Settings → Models** while you're online.
+
+**Heads up, it's CPU work:** Transcription runs on your NOMAD's processor, no GPU needed, and takes roughly as long as the recording on a modest machine (an hour of audio takes about an hour; a fast desktop CPU is several times quicker). Uploaded files are queued and processed one at a time, so you can drop in several and come back later. The model needs about a gigabyte of memory while it works.
+
+**No microphone, no radio:** The container has no audio input, so there's no live recording in this app. Live radio logging through a sound card is what the Commscribe desktop app is for; the NOMAD app is where you bring recordings that already exist.
+
+**Your data:** Everything lives in the `storage/commscribe` folder on your NOMAD: the database, the audio (converted to 16 kHz WAV on upload, about 115 MB per hour; the original file is not kept), your settings, and the speech models. Backing up that folder backs up the whole log. Nothing leaves your NOMAD unless you deliberately enter a cloud API key under **Settings → Cloud**.
+
+**Works offline:** Fully offline with the built-in model. The only things that use the internet are downloading additional models and the optional cloud services, and both are things you choose to do.
